@@ -98,21 +98,48 @@ Het script zal:
 
 **Let op**: Het script stopt bij de betalingspagina. Je moet zelf de betaling afronden!
 
-### Automatisch uitvoeren met cron
+### Automatisch uitvoeren via Home Assistant
 
-Om het script wekelijks automatisch uit te voeren (bijvoorbeeld 5 dagen van tevoren, om 9:00):
+Het script kan elke nacht om 00:01 automatisch worden gestart vanuit Home Assistant via `run_booking.sh`.
+
+#### 1. Shell script uitvoerbaar maken
 
 ```bash
-# Bewerk je crontab
-crontab -e
-
-# Voeg deze regel toe (pas het pad aan):
-0 9 * * 6 cd /Users/jouw-naam/Projects/knltb-padel-booking && python booking.py >> booking.log 2>&1
+chmod +x run_booking.sh
 ```
 
-Dit runt het script elke zaterdag om 9:00 en logt de output naar `booking.log`.
+Het script:
+- Activeert de Python virtual environment
+- Draait `booking.py` en logt output naar `booking.log`
+- Geeft exit code terug: `0` = boeking geslaagd, `1` = geen slot gevonden, `130` = onderbroken
 
-Voor 120 uur (5 dagen) van tevoren, bereken je de juiste dag en tijd op basis van je gewenste boekingsdatum.
+#### 2. Home Assistant configuratie
+
+Voeg het volgende toe aan `configuration.yaml` (pas het pad aan naar de locatie op je HA host):
+
+```yaml
+shell_command:
+  run_padel_booking: "/bin/bash /pad/naar/knltb-padel-booking/run_booking.sh"
+```
+
+#### 3. Home Assistant automation
+
+Voeg toe aan `automations.yaml` of maak aan via de UI:
+
+```yaml
+- alias: "Padel booking — dagelijkse run 00:01"
+  trigger:
+    - platform: time
+      at: "00:01:00"
+  action:
+    - service: shell_command.run_padel_booking
+```
+
+#### 4. Log bekijken
+
+```bash
+tail -f booking.log
+```
 
 ## Notificaties
 
@@ -172,6 +199,9 @@ knltb-padel-booking/
 ├── booking.py           # Hoofdscript
 ├── session.py           # Cookie/session management
 ├── notify.py            # Notificatie systeem
+├── run_booking.sh        # Shell script voor Home Assistant scheduling
+├── conftest.py          # pytest configuratie (--headed optie)
+├── test_integration.py  # End-to-end integratietest
 └── .session_cookies.json # Opgeslagen sessie (niet in git)
 ```
 

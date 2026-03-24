@@ -200,10 +200,17 @@ class PadelBooker:
 
         if email and password:
             logger.info("Credentials gevonden in omgeving — automatisch inloggen...")
-            return self.session_manager.auto_login(browser, email, password)
+            new_context, success = self.session_manager.auto_login(browser, email, password)
+            if success:
+                return new_context
 
-        # Geen credentials: handmatige login (geeft een headed browser)
-        logger.info("Geen KNLTB_EMAIL/KNLTB_PASSWORD in omgeving — handmatige login")
+            # Auto-login mislukt (bot-detectie / 2FA): val terug op handmatige login
+            logger.info("Automatisch inloggen mislukt — handmatige login via headed browser")
+
+        # Geen credentials of auto-login mislukt: handmatige login in headed browser
+        if not email and not password:
+            logger.info("Geen KNLTB_EMAIL/KNLTB_PASSWORD in omgeving — handmatige login")
+
         headed_browser = self._playwright.chromium.launch(headless=False)
         new_context = self.session_manager.manual_login(headed_browser)
         # Kopieer cookies naar de primaire (headless) context
@@ -240,13 +247,15 @@ class PadelBooker:
 
         logger.info("Zoeken naar clubs in %s (straal %s km) op %s...", city, radius, date_str)
 
-        page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+        page.goto(SEARCH_URL, wait_until="load", timeout=30000)
         page.wait_for_timeout(1500)
         self._accept_cookies(page)
 
-        # Sport: Padel
-        page.locator("select#sportId").select_option("2")
-        page.wait_for_timeout(1500)
+        # Sport: Padel (sla over als het veld uitgeschakeld is — al vooringesteld)
+        sport_select = page.locator("select#sportId")
+        if sport_select.count() > 0 and not sport_select.is_disabled():
+            sport_select.select_option("2")
+            page.wait_for_timeout(1500)
 
         # Locatie invoeren en blur triggeren (Livewire)
         loc_input = page.locator("input#location")
@@ -310,6 +319,7 @@ class PadelBooker:
         """
         time_start = self.config["booking"]["time_start"]   # bijv. "19:00"
         time_end = self.config["booking"]["time_end"]       # bijv. "21:30"
+        duration_minutes = int(self.config["booking"].get("duration_minutes", 90))
         booking_date = self._get_next_booking_date()
         date_str = booking_date.strftime("%d-%m-%Y")
         game_type = self.config["booking"].get("game_type", "double").lower()
@@ -319,13 +329,13 @@ class PadelBooker:
             club["name"], date_str, time_start, time_end
         )
 
-        page.goto(club["url"], wait_until="networkidle", timeout=30000)
+        page.goto(club["url"], wait_until="load", timeout=30000)
         page.wait_for_timeout(1500)
         self._accept_cookies(page)
 
-        # Sport: Padel
+        # Sport: Padel (sla over als het veld uitgeschakeld is — al vooringesteld)
         sport_select = page.locator("select#sportId")
-        if sport_select.count() > 0:
+        if sport_select.count() > 0 and not sport_select.is_disabled():
             sport_select.select_option("2")
             page.wait_for_timeout(1500)
 
@@ -342,6 +352,15 @@ class PadelBooker:
         if daypart_select.count() > 0:
             daypart_select.select_option("evening")
             page.wait_for_timeout(1500)
+
+        # Duur selecteren (bijv. 90 minuten)
+        duration_select = page.locator("select#duration")
+        if duration_select.count() > 0:
+            duration_select.select_option(str(duration_minutes))
+            page.wait_for_timeout(1500)
+            logger.info("Duur ingesteld op %d minuten", duration_minutes)
+        else:
+            logger.debug("Geen duration-select gevonden op pagina")
 
         # Datum instellen via Livewire
         html = page.content()
@@ -409,6 +428,17 @@ class PadelBooker:
             if not (start_minutes <= slot_start_min < end_minutes):
                 continue
 
+            # Controleer duur als die vermeld staat in de tijdslot-tekst
+            duration_match = re.search(r"(\d+)\s*min", time_text, re.IGNORECASE)
+            if duration_match:
+                slot_duration = int(duration_match.group(1))
+                if slot_duration != duration_minutes:
+                    logger.debug(
+                        "Tijdslot om %s overgeslagen: duur %d min ≠ gewenste %d min",
+                        slot_start_str, slot_duration, duration_minutes
+                    )
+                    continue
+
             # Gevonden!
             try:
                 court_name = slot.locator(".timeslot-name").first.inner_text().strip()
@@ -455,72 +485,147 @@ class PadelBooker:
             slot_id, slot_info["time_range"], slot_info["club_name"]
         )
 
-        # Stap 1: klik op het tijdslot (activeert de "Toevoegen"-knop)
-        slot_anchor = page.locator(f"a.timeslot#{slot_id}")
+        # Stap 1: klik op het tijdslot (opent detail/modal)
+        # Gebruik altijd attribuut-selector: numerieke IDs zijn ongeldig als CSS #id selector
+        slot_anchor = page.locator(f"a.timeslot[id='{slot_id}']")
         if slot_anchor.count() == 0:
-            # Fallback: zoek op data-attribute
             slot_anchor = page.locator(f"a[id='{slot_id}']")
 
-        add_btn = slot_anchor.locator('button:has-text("Toevoegen")')
-        if add_btn.count() == 0:
-            logger.warning("'Toevoegen'-knop niet gevonden in tijdslot %s", slot_id)
+        if slot_anchor.count() == 0:
+            logger.warning("Tijdslot-anker niet gevonden voor id %s", slot_id)
             return False
 
+        slot_anchor.first.click()
+        page.wait_for_timeout(2000)
+
+        # Stap 2: klik "Toevoegen" — kan binnen het slot staan OF buiten (modal/sidebar)
+        add_btn = page.locator('button:has-text("Toevoegen")')
+        if add_btn.count() == 0:
+            # Alternatieve tekst
+            add_btn = page.locator('button:has-text("Reserveren")')
+        if add_btn.count() == 0:
+            add_btn = page.locator('button:has-text("Boeken")')
+
+        if add_btn.count() == 0:
+            logger.warning("'Toevoegen'/'Reserveren'/'Boeken'-knop niet gevonden na klik op tijdslot %s", slot_id)
+            logger.debug("Pagina-inhoud (fragment): %s", page.content()[:2000])
+            return False
+
+        logger.info("'%s'-knop gevonden, klikken...", add_btn.first.inner_text().strip())
         add_btn.first.click()
         page.wait_for_timeout(2500)
 
-        # Stap 2: klik "Afrekenen"
-        checkout_btn = page.locator(f'button[wire\\:click="checkout({slot_id})"]')
-        if checkout_btn.count() == 0:
-            # Bredere selector als fallback
-            checkout_btn = page.locator('button:has-text("Afrekenen")')
+        # Stap 3: klik "Afrekenen" — gebruik de zichtbare knop via Playwright's :visible filter
+        # Er kunnen meerdere "Afrekenen"-knoppen in de DOM zijn (zichtbaar + verborgen).
+        checkout_locators = [
+            f'button[wire\\:click="checkout({slot_id})"]:visible',
+            'button[wire\\:click="checkout"]:visible',
+            'button:visible:has-text("Afrekenen")',
+            'a:visible:has-text("Afrekenen")',
+        ]
 
-        if checkout_btn.count() == 0:
+        checkout_btn = None
+        for selector in checkout_locators:
+            candidate = page.locator(selector)
+            if candidate.count() > 0:
+                checkout_btn = candidate
+                logger.info("'Afrekenen'-knop gevonden via selector: %s", selector)
+                break
+
+        if checkout_btn is None:
             logger.warning("'Afrekenen'-knop niet gevonden na toevoegen")
+            logger.debug("Pagina-inhoud (fragment): %s", page.content()[:3000])
             return False
 
+        logger.info("'Afrekenen'-knop klikken...")
         checkout_btn.first.click()
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except PlaywrightTimeoutError:
-            pass
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
 
         current_url = page.url
         logger.info("URL na afrekenen: %s", current_url)
 
-        # Controleer of we op een betaal/checkout pagina zijn
-        payment_keywords = ["payment", "checkout", "betaling", "betalen", "order", "bestelling"]
-        if any(kw in current_url.lower() for kw in payment_keywords):
-            logger.info("Betalingspagina bereikt!")
-            notify_booking_available(
-                slot_info["court_name"],
-                slot_info["time_range"],
-                f"{slot_info['club_name']} — {slot_info['club_address']}",
-            )
-            print("\n" + "=" * 60)
-            print("BETALINGSPAGINA BEREIKT")
-            print("=" * 60)
-            print(f"Club:  {slot_info['club_name']}")
-            print(f"Adres: {slot_info['club_address']}")
-            print(f"Baan:  {slot_info['court_name']}")
-            print(f"Tijd:  {slot_info['time_range']}")
-            print("=" * 60)
-            print("Script stopt. Rond de betaling zelf af in de browser.")
-            print("=" * 60 + "\n")
-            # Houd browser 30 seconden open zodat de gebruiker kan kijken
-            page.wait_for_timeout(30000)
-            return True
-
-        # Mogelijk werd doorgestuurd naar login (sessie verlopen tijdens boeking)
+        # Sessie verlopen tijdens boeking?
         if "inloggen" in current_url:
             logger.error("Doorgestuurd naar loginpagina tijdens boeking — sessie verlopen")
-        else:
-            logger.warning(
-                "Betalingspagina niet bereikt. Huidige URL: %s", current_url
-            )
-        return False
+            return False
+
+        # Meetandplay gebruikt Livewire: de winkelwagenpagina laadt op dezelfde URL.
+        # Controleer of de breadcrumb of paginatitel "Winkelwagen" toont.
+        page_html = page.content()
+        on_cart = (
+            "winkelwagen" in current_url.lower()
+            or "Winkelwagen" in page_html
+        )
+
+        if not on_cart:
+            # Mogelijk directe redirect naar betaalpagina of /reserveren
+            payment_keywords = ["payment", "checkout", "betaling", "betalen", "order", "bestelling", "reserveren"]
+            if any(kw in current_url.lower() for kw in payment_keywords):
+                on_cart = True  # behandel als succes hieronder
+
+        if not on_cart:
+            logger.warning("Winkelwagen/betalingspagina niet bereikt. Huidige URL: %s", current_url)
+            try:
+                page.screenshot(path="debug_after_checkout.png", full_page=True)
+                logger.info("Debug-screenshot opgeslagen: debug_after_checkout.png")
+            except Exception:
+                pass
+            return False
+
+        logger.info("Winkelwagen bereikt — wachten op betaalknop...")
+
+        # Wacht op de betaalknop en klik erop
+        pay_selectors = [
+            'a:has-text("Betalen")',
+            'button:has-text("Betalen")',
+            'a:has-text("Afrekenen")',
+            'button:has-text("Nu betalen")',
+            'a[href*="betalen"]',
+            'a[href*="payment"]',
+        ]
+        pay_btn = None
+        for _ in range(6):  # maximaal ~12 seconden wachten
+            for sel in pay_selectors:
+                candidate = page.locator(sel)
+                if candidate.count() > 0:
+                    try:
+                        if candidate.first.is_visible():
+                            pay_btn = candidate
+                            break
+                    except Exception:
+                        pass
+            if pay_btn:
+                break
+            page.wait_for_timeout(2000)
+
+        if pay_btn:
+            logger.info("Betaalknop gevonden, klikken...")
+            pay_btn.first.click()
+            page.wait_for_timeout(3000)
+            current_url = page.url
+            logger.info("URL na betaalknop: %s", current_url)
+
+        # Succes: notificeer en houd browser open
+        notify_booking_available(
+            slot_info["court_name"],
+            slot_info["time_range"],
+            f"{slot_info['club_name']} — {slot_info['club_address']}",
+        )
+        print("\n" + "=" * 60)
+        print("BOEKING GESLAAGD — WINKELWAGEN BEREIKT")
+        print("=" * 60)
+        print(f"Club:  {slot_info['club_name']}")
+        print(f"Adres: {slot_info['club_address']}")
+        print(f"Baan:  {slot_info['court_name']}")
+        print(f"Tijd:  {slot_info['time_range']}")
+        print(f"URL:   {current_url}")
+        print("=" * 60)
+        print("Script stopt. Rond de betaling zelf af in de browser.")
+        print("=" * 60 + "\n")
+        # Houd browser 30 seconden open zodat de gebruiker kan kijken
+        page.wait_for_timeout(30000)
+        return True
 
     # ------------------------------------------------------------------
     # Hoofdflow

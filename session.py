@@ -6,10 +6,20 @@ Beheert cookies voor hergebruik van sessies.
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from playwright.sync_api import Browser, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_user(page, message: str) -> None:
+    """Wacht op gebruikersinvoer als stdin een terminal is, anders 60 seconden."""
+    if sys.stdin.isatty():
+        input(message)
+    else:
+        logger.warning("%s (geen terminal — wacht 60 seconden)", message)
+        page.wait_for_timeout(60000)
 
 
 class SessionManager:
@@ -86,13 +96,24 @@ class SessionManager:
             True als ingelogd, False anders
         """
         try:
-            page.goto("https://www.meetandplay.nl", wait_until="networkidle", timeout=15000)
-            page.wait_for_timeout(1500)
+            # Navigeer alleen als we niet al op meetandplay.nl zijn
+            if "meetandplay.nl" not in page.url:
+                page.goto("https://www.meetandplay.nl", wait_until="load", timeout=15000)
+                page.wait_for_timeout(1500)
+            else:
+                page.wait_for_load_state("load", timeout=15000)
+                page.wait_for_timeout(1500)
+
+            # Na SSO redirect kunnen we op de KNLTB ID pagina zijn beland — dan opnieuw proberen
+            if "meetandplay.nl" not in page.url:
+                logger.info("Niet op meetandplay.nl na sessiecheck (%s) — als niet ingelogd beschouwen", page.url)
+                return False
 
             # Als de gebruiker ingelogd is, verdwijnt de 'Inloggen'-link uit de nav
             # en verschijnt er een 'Uitloggen' of account-gerelateerde link.
-            # De 'Inloggen'-link heeft href="https://meetandplay.nl/inloggen"
-            login_link = page.locator('a[href="https://meetandplay.nl/inloggen"]')
+            login_link = page.locator(
+                'a[href="https://meetandplay.nl/inloggen"], a[href="/inloggen"]'
+            )
             if login_link.count() > 0:
                 logger.info("Sessie verlopen: 'Inloggen'-link aanwezig in navigatie")
                 return False
@@ -117,7 +138,7 @@ class SessionManager:
             logger.warning("Fout bij controleren login status: %s", e)
             return False
 
-    def auto_login(self, browser: Browser, email: str, password: str) -> BrowserContext:
+    def auto_login(self, browser: Browser, email: str, password: str) -> tuple:
         """
         Probeer automatisch in te loggen via KNLTB ID SSO.
 
@@ -131,7 +152,7 @@ class SessionManager:
             password: KNLTB wachtwoord
 
         Returns:
-            Browser context met de nieuwe sessie
+            (BrowserContext, True) als login gelukt, (None, False) anders
         """
         import re as _re
 
@@ -148,7 +169,7 @@ class SessionManager:
         page = context.new_page()
 
         try:
-            page.goto("https://www.meetandplay.nl/inloggen", wait_until="networkidle", timeout=30000)
+            page.goto("https://www.meetandplay.nl/inloggen", wait_until="load", timeout=30000)
             page.wait_for_timeout(1500)
 
             # Accepteer cookie banner indien aanwezig
@@ -175,7 +196,7 @@ class SessionManager:
                 page.locator('form[wire\\:submit="submit"]').first.evaluate(
                     'el => el.dispatchEvent(new Event("submit", {bubbles:true, cancelable:true}))'
                 )
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("load", timeout=15000)
                 page.wait_for_timeout(2000)
             else:
                 # KNLTB ID SSO flow: haal de SSO-link op uit de Livewire HTML
@@ -186,23 +207,47 @@ class SessionManager:
                 if sso_match:
                     sso_url = sso_match.group(1).replace('&amp;', '&')
                     logger.info("KNLTB ID SSO redirect gevonden")
-                    page.goto(sso_url, wait_until="networkidle", timeout=30000)
+                    page.goto(sso_url, wait_until="load", timeout=30000)
                     page.wait_for_timeout(2000)
 
-                    # Op het KNLTB ID portaal: vul wachtwoord in
-                    # Het exacte formulier hangt af van id.knltb.nl
+                    # Op het KNLTB ID portaal: two-step login
+                    # Stap A: vul e-mailadres/username in (veld: Login.Email of vergelijkbaar)
+                    username_field = page.locator(
+                        'input[name="Login.Email"], input[name="Username"], '
+                        'input[name="email"], input[type="email"]'
+                    )
+                    if username_field.count() > 0:
+                        logger.info("Stap A: username/email invullen op SSO pagina")
+                        username_field.first.fill(email)
+                        submit_btn = page.locator('button[type="submit"], input[type="submit"]')
+                        if submit_btn.count() > 0:
+                            submit_btn.first.click()
+                            page.wait_for_timeout(2000)
+
+                    # Stap B: wacht op wachtwoordveld en vul in
+                    try:
+                        page.wait_for_selector(
+                            'input[type="password"], input[name="Password"], input[name="password"]',
+                            state='visible',
+                            timeout=10000,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Wachtwoordveld niet zichtbaar na stap A op SSO pagina (%s)", page.url
+                        )
+
                     pw_input = page.locator(
                         'input[type="password"], input[name="Password"], input[name="password"]'
                     )
                     if pw_input.count() > 0:
+                        logger.info("Stap B: wachtwoord invullen op SSO pagina")
                         pw_input.first.fill(password)
-                        # Submit het formulier
                         submit_btn = page.locator(
                             'button[type="submit"], input[type="submit"]'
                         )
                         if submit_btn.count() > 0:
                             submit_btn.first.click()
-                            page.wait_for_load_state("networkidle", timeout=30000)
+                            page.wait_for_load_state("load", timeout=30000)
                             page.wait_for_timeout(2000)
                     else:
                         logger.warning(
@@ -215,22 +260,24 @@ class SessionManager:
                     )
 
             # Controleer of login gelukt is
-            if self.is_logged_in(page):
-                logger.info("Automatisch inloggen gelukt!")
-                self.save_cookies(context)
-            else:
-                logger.warning(
-                    "Automatisch inloggen mogelijk mislukt. Cookies worden toch opgeslagen."
-                )
-                self.save_cookies(context)
+            login_ok = self.is_logged_in(page)
 
         except Exception as e:
             logger.error("Fout tijdens automatisch inloggen: %s", e)
-            self.save_cookies(context)
-        finally:
-            page.close()
+            login_ok = False
 
-        return context
+        if login_ok:
+            page.close()
+            logger.info("Automatisch inloggen gelukt!")
+            self.save_cookies(context)
+            return context, True
+
+        logger.warning("Automatisch inloggen mislukt (bot-detectie of 2FA vereist).")
+        logger.warning("Browser blijft open zodat je de fout kunt bekijken.")
+        _wait_for_user(page, "Druk op ENTER om door te gaan... ")
+        page.close()
+        context.close()
+        return None, False
 
     def manual_login(self, browser: Browser, url: str = "https://www.meetandplay.nl/inloggen") -> BrowserContext:
         """
@@ -265,7 +312,7 @@ class SessionManager:
         page = context.new_page()
         page.goto(url)
 
-        input("Druk op ENTER nadat je bent ingelogd... ")
+        _wait_for_user(page, "Druk op ENTER nadat je bent ingelogd... ")
 
         if self.is_logged_in(page):
             logger.info("Handmatige login succesvol!")
