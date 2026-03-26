@@ -8,7 +8,7 @@ set -e
 [ -f /config/knltb/.session_cookies.json ] && cp /config/knltb/.session_cookies.json /app/.session_cookies.json
 
 cd /app
-python booking.py
+python booking.py --debug
 
 # Persisteer cookies zodat de sessie bewaard blijft tussen runs
 mkdir -p /config/knltb
